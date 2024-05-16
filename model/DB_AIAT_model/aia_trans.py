@@ -704,7 +704,7 @@ class DF_aia_complex_trans_ri_causal(nn.Module):
         return DF_real, DF_imag
 
 if __name__ == '__main__':
-    model = DF_aia_complex_trans_ri_causal()   #### slim_dual_aia_trans_merge dual_aia_trans_merge_crm
+    model = aia_complex_trans_ri_new()   #### slim_dual_aia_trans_merge dual_aia_trans_merge_crm
     model.eval()
     # x = torch.FloatTensor(4, 2, 10, 481)
     #

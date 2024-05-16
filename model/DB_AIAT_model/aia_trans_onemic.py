@@ -66,7 +66,7 @@ class dual_aia_trans_merge_crm_onemic(nn.Module):
     def forward(self, x):
         batch_size, _, seq_len, _ = x.shape
         noisy_real = x[:, 0, :, :]
-        noisy_imag = x[:, 4, :, :]
+        noisy_imag = x[:, 1, :, :]
         noisy_spec = torch.stack([noisy_real, noisy_imag], 1)
         x_mag_ori, x_phase_ori = torch.norm(noisy_spec, dim=1), torch.atan2(noisy_spec[:, -1, :, :], noisy_spec[:, 0, :, :])
         x_mag = x_mag_ori.unsqueeze(dim = 1)
@@ -142,9 +142,9 @@ class aia_complex_trans_mag(nn.Module):
 
         return x_com_out
 
-class aia_complex_trans_ri(nn.Module):
+class new_aia_complex_trans_ri(nn.Module):
     def __init__(self):
-        super(aia_complex_trans_ri, self).__init__()
+        super(new_aia_complex_trans_ri, self).__init__()
         self.en_ri = dense_encoder()
 
         self.dual_trans = AIA_Transformer(64, 64, num_layers=4)
@@ -158,9 +158,9 @@ class aia_complex_trans_ri(nn.Module):
 
     def forward(self, x):
         batch_size, _, seq_len, _ = x.shape
-        x_r_input, x_i_input = x[:,0,:,:], x[:,1,:,:]
-        x_mag_ori, x_phase_ori = torch.norm(x, dim=1), torch.atan2(x[:, -1, :, :], x[:, 0, :, :])
-        x_mag = x_mag_ori.unsqueeze(dim = 1)
+        noisy_real, noisy_imag = x[:,0,:,:], x[:,1,:,:]
+
+
         # ri components enconde+ aia_transformer
         x_ri = self.en_ri(x) #BCTF
         x_last , x_outputlist = self.dual_trans(x_ri) #BCTF, #BCTFG
@@ -172,17 +172,19 @@ class aia_complex_trans_ri(nn.Module):
         x_imag = self.de2(x_ri)
         x_real = x_real.squeeze(dim = 1)
         x_imag = x_imag.squeeze(dim=1)
-        x_com=torch.stack((x_real, x_imag), dim=1)
+
+        enh_real = noisy_real * x_real - noisy_imag * x_imag
+        enh_imag = noisy_real * x_imag + noisy_imag * x_real
 
 
-        return x_com
+        return enh_real, enh_imag
 
 
 
 class dense_encoder(nn.Module):
     def __init__(self, width =64):
         super(dense_encoder, self).__init__()
-        self.in_channels = 8
+        self.in_channels = 2
         self.out_channels = 1
         self.width = width
         self.inp_conv = nn.Conv2d(in_channels=self.in_channels, out_channels=self.width, kernel_size=(1, 1))  # [b, 64, nframes, 512]
@@ -327,9 +329,9 @@ class DenseBlock(nn.Module): #dilated dense block
 
 
 if __name__ == '__main__':
-    model = dual_aia_trans_merge_crm_onemic()
+    model = new_aia_complex_trans_ri()
     model.eval()
-    x = torch.FloatTensor(4, 8, 10, 257)
+    x = torch.FloatTensor(4, 2, 10, 257)
     #
     # params_of_network = 0
     # for param in model.parameters():
