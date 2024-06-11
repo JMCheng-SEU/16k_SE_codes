@@ -3,7 +3,7 @@ from torch.nn.parameter import Parameter
 from torch import Tensor, nn
 from model.AIA_DPCRN.aia_net import AHAM, TransformerEncoderLayer, TransformerEncoderLayer_new
 from thop import profile
-# from model.multiframe import DF
+from model.multiframe import DF
 
 
 class DilatedDenseNet(nn.Module):
@@ -628,6 +628,87 @@ class AIA_CRN_SIG_oneL(nn.Module):
         return enh_real, enh_imag, x_last, enc_list, dec_list
 
 
+class DF_AIA_CRN_oneL(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        self.df_order = 5
+        self.df_bins = 257
+
+        # self.input_ln = nn.LayerNorm(normalized_shape=[201, 2])
+
+        self.dense_encoder = DenseEncoder_Res(in_channel=2, channels=128)
+
+
+        self.dual_trans = AIA_Transformer_onelayer(128, 128)
+
+        # self.DPRNN_1 = DPRNN_Block(numUnits=128, width=64)
+        # self.DPRNN_2 = DPRNN_Block(numUnits=128, width=64)
+
+        self.complex_decoder = ComplexDecoder_Res_new(num_channel=128)
+
+        self.DF_complex_decoder = DF_ComplexDecoder_Res_new(num_channel=128, df_order=5)
+
+        self.df_op = DF(num_freqs=self.df_bins, frame_size=self.df_order, lookahead=0)
+
+        self.df_out_transform = DfOutputReshapeMF(self.df_order, self.df_bins)
+
+
+    def forward(
+        self, spec
+    ):
+
+        # spec: [B, 2, T, Fc]
+        b, c, t, f = spec.shape
+
+        out_1 = self.dense_encoder(spec)
+
+        x_last = self.dual_trans(out_1) #BCTF, #BCTFG
+
+        # DPRNN_out1 = self.DPRNN_1(out_1)
+        # DPRNN_out2 = self.DPRNN_2(DPRNN_out1)
+
+        complex_out = self.complex_decoder(x_last)
+        # mask_out = convT5_out[:, :, :, :-2]
+
+        df_coefs = self.DF_complex_decoder(x_last)
+
+        df_coefs = df_coefs.permute(0, 2, 3, 1)
+
+        df_coefs = self.df_out_transform(df_coefs).contiguous()
+
+
+
+
+
+        mask_real = complex_out[:, 0, :, :]
+        mask_imag = complex_out[:, 1, :, :]
+
+        noisy_real = spec[:, 0, :, :]
+        noisy_imag = spec[:, 1, :, :]
+
+        ####### simple complex reconstruct
+
+        enh_real = noisy_real * mask_real - noisy_imag * mask_imag
+        enh_imag = noisy_real * mask_imag + noisy_imag * mask_real
+
+        enhanced_D = torch.stack([enh_real, enh_imag], 3)
+
+        enhanced_D = enhanced_D.unsqueeze(1)
+
+        DF_spec = self.df_op(enhanced_D.clone(), df_coefs)
+
+        DF_spec = DF_spec.squeeze(1)
+
+        DF_real = DF_spec[:, :, :, 0]
+        DF_imag = DF_spec[:, :, :, 1]
+
+
+        return DF_real, DF_imag
+
+
+
+
 class DPDCRNN_Block_merge_new(nn.Module):
 
     def __init__(
@@ -958,9 +1039,9 @@ class DIL_AIA_DCRN_merge_new(nn.Module):
 
 
 if __name__ == '__main__':
-    inputs = torch.randn(1, 2, 100, 257)
+    inputs = torch.randn(1, 2, 10, 257)
 
-    Model = DIL_AIA_DCRN_merge_new()
+    Model = DF_AIA_CRN_oneL()
 
     # input_test = torch.FloatTensor(1, 2, 100, 257)
     # flops, params = profile(Model, inputs=(input_test,))
@@ -974,4 +1055,4 @@ if __name__ == '__main__':
 
     print(f"\tNetwork: {params_of_network / 1e6} million.")
     #
-    # print(enh_real.shape)
+    print(enh_real.shape)
