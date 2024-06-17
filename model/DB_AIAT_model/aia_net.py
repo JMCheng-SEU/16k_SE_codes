@@ -120,6 +120,58 @@ class TransformerEncoderLayer(nn.Module):
         src = self.norm2(src)
         return src
 
+class LSTM_TransformerEncoderLayer(nn.Module):
+    def __init__(self, d_model, nhead, bidirectional=True, dropout=0, activation="relu"):
+        super(LSTM_TransformerEncoderLayer, self).__init__()
+        self.self_attn = MultiheadAttention(d_model, nhead, dropout=dropout)
+        # Implementation of Feedforward model
+        self.lstm = LSTM(d_model, d_model*2, 1, bidirectional=bidirectional)
+        self.dropout = Dropout(dropout)
+        if bidirectional:
+            self.linear2 = Linear(d_model*2*2, d_model)
+        else:
+            self.linear2 = Linear(d_model*2, d_model)
+
+
+        self.norm1 = LayerNorm(d_model)
+        self.norm2 = LayerNorm(d_model)
+        self.norm3 = LayerNorm(d_model)
+        self.dropout1 = Dropout(dropout)
+        self.dropout2 = Dropout(dropout)
+
+        self.activation = _get_activation_fn(activation)
+
+    def __setstate__(self, state):
+        if 'activation' not in state:
+            state['activation'] = F.relu
+        super(TransformerEncoderLayer, self).__setstate__(state)
+
+    def forward(self, src, src_mask=None, src_key_padding_mask=None):
+        # type: (Tensor, Optional[Tensor], Optional[Tensor]) -> Tensor
+        r"""Pass the input through the encoder layer.
+        Args:
+            src: the sequnce to the encoder layer (required).
+            src_mask: the mask for the src sequence (optional).
+            src_key_padding_mask: the mask for the src keys per batch (optional).
+        Shape:
+            see the docs in Transformer class.
+        """
+        src_norm = self.norm3(src)
+        src2 = self.self_attn(src_norm, src_norm, src_norm, attn_mask=src_mask,
+                              key_padding_mask=src_key_padding_mask)[0]
+        src = src + self.dropout1(src2)
+        src = self.norm1(src)
+        self.lstm.flatten_parameters()
+        out, h_n = self.lstm(src)
+        del h_n
+        src2 = self.linear2(self.dropout(self.activation(out)))
+        src = src + self.dropout2(src2)
+        src = self.norm2(src)
+        return src
+
+
+
+
 class TransformerEncoderLayer_cau(nn.Module):
     def __init__(self, d_model, nhead, bidirectional=True, dropout=0, activation="relu"):
         super(TransformerEncoderLayer_cau, self).__init__()
@@ -287,6 +339,71 @@ class AIA_Transformer_cau(nn.Module):
         del row_input, row_output, col_input, col_output
 
         return output_i, output_list
+
+
+class AIA_Transformer_Serial(nn.Module):
+    """
+    Adaptive time-frequency attention Transformer without interaction on maginitude path and complex path.
+    args:
+        input_size: int, dimension of the input feature. The input should have shape
+                    (batch, seq_len, input_size).
+        hidden_size: int, dimension of the hidden state.
+        output_size: int, dimension of the output size.
+        dropout: float, dropout ratio. Default is 0.
+        num_layers: int, number of stacked RNN layers. Default is 1.
+    """
+
+    def __init__(self, input_size,output_size, dropout=0, num_layers=1):
+        super(AIA_Transformer_Serial, self).__init__()
+
+        self.input_size = input_size
+        self.output_size = output_size
+        self.k1 = Parameter(torch.ones(1))
+        self.k2 = Parameter(torch.ones(1))
+
+        self.input = nn.Sequential(
+            nn.Conv2d(input_size, input_size // 2, kernel_size=1),
+            nn.PReLU()
+        )
+
+        # dual-path RNN
+        self.row_trans = nn.ModuleList([])
+        self.col_trans = nn.ModuleList([])
+        self.row_norm = nn.ModuleList([])
+        self.col_norm = nn.ModuleList([])
+        for i in range(num_layers):
+            self.row_trans.append(LSTM_TransformerEncoderLayer(d_model=input_size//2, nhead=4, dropout=dropout, bidirectional=True))
+            self.col_trans.append(LSTM_TransformerEncoderLayer(d_model=input_size//2, nhead=4, dropout=dropout, bidirectional=True))
+            self.row_norm.append(nn.GroupNorm(1, input_size//2, eps=1e-8))
+            self.col_norm.append(nn.GroupNorm(1, input_size//2, eps=1e-8))
+
+        # output layer
+        self.output = nn.Sequential(nn.PReLU(),
+                                    nn.Conv2d(input_size//2, output_size, 1)
+                                    )
+
+    def forward(self, input):
+        #  input --- [b,  c,  num_frames, frame_size]  --- [b, c, dim2, dim1]
+        b, c, dim2, dim1 = input.shape
+
+        output = self.input(input)
+        for i in range(len(self.row_trans)):
+            row_input = output.permute(3, 0, 2, 1).contiguous().view(dim1, b*dim2, -1)  # [F, B*T, c]
+            row_output = self.row_trans[i](row_input)  # [F, B*T, c]
+            row_output = row_output.view(dim1, b, dim2, -1).permute(1, 3, 2, 0).contiguous()  # [B, C, T, F]
+            row_output = self.row_norm[i](row_output)  # [B, C, T, F]
+
+            col_input = output.permute(2, 0, 3, 1).contiguous().view(dim2, b*dim1, -1)
+            col_output = self.col_trans[i](col_input)
+            col_output = col_output.view(dim2, b, dim1, -1).permute(1, 3, 0, 2).contiguous()
+            col_output = self.col_norm[i](col_output)
+            output = output + self.k1*row_output + self.k2*col_output
+
+        del row_input, row_output, col_input, col_output
+        output_s = self.output(output)
+
+        return output_s
+
 
 
 class AIA_Transformer(nn.Module):

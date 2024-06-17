@@ -1,9 +1,11 @@
 import torch
 import torch.nn as nn
 from torch.autograd import Variable
-from model.DB_AIAT_model.aia_net import AIA_Transformer, AIA_Transformer_merge, AHAM, AHAM_ori
+from model.DB_AIAT_model.aia_net import AIA_Transformer, AIA_Transformer_merge, AHAM, AHAM_ori, AIA_Transformer_Serial
 
 from model.DB_AIAT_model.Backup_pesq import numParams
+from model.multiframe import DF
+
 
 class dual_aia_complex_trans(nn.Module):
     def __init__(self):
@@ -180,6 +182,131 @@ class new_aia_complex_trans_ri(nn.Module):
         return enh_real, enh_imag
 
 
+class DfOutputReshapeMF(nn.Module):
+    """Coefficients output reshape for multiframe/MultiFrameModule
+
+    Requires input of shape B, C, T, F, 2.
+    """
+
+    def __init__(self, df_order: int, df_bins: int):
+        super().__init__()
+        self.df_order = df_order
+        self.df_bins = df_bins
+
+    def forward(self, coefs):
+        # [B, T, F, O*2] -> [B, O, T, F, 2]
+        new_shape = list(coefs.shape)
+        new_shape[-1] = -1
+        new_shape.append(2)
+        coefs = coefs.view(new_shape)
+        coefs = coefs.permute(0, 3, 1, 2, 4)
+        return coefs
+
+class DF_Serial_aia_complex_trans_ri(nn.Module):
+    def __init__(self):
+        super(DF_Serial_aia_complex_trans_ri, self).__init__()
+        self.df_order = 5
+        self.df_bins = 257
+        self.en_ri = dense_encoder()
+
+        self.dual_trans = AIA_Transformer_Serial(64, 64, num_layers=4)
+        # self.aham = AHAM(input_channel=64)
+
+
+        self.de1 = dense_decoder()
+        self.de2 = dense_decoder()
+
+        self.DF_de = DF_dense_decoder(width=64, df_order=5)
+
+        self.df_op = DF(num_freqs=self.df_bins, frame_size=self.df_order, lookahead=0)
+
+        self.df_out_transform = DfOutputReshapeMF(self.df_order, self.df_bins)
+
+    def forward(self, x):
+
+        noisy_real, noisy_imag = x[:,0,:,:], x[:,1,:,:]
+
+
+        # ri components enconde+ aia_transformer
+        x_ri = self.en_ri(x) #BCTF
+        x_last = self.dual_trans(x_ri) #BCTF, #BCTFG
+        # x_ri = self.aham(x_outputlist) #BCTF
+
+        df_coefs = self.DF_de(x_last)
+
+        df_coefs = df_coefs.permute(0, 2, 3, 1)
+
+        df_coefs = self.df_out_transform(df_coefs).contiguous()
+
+
+        # real and imag decode
+        x_real = self.de1(x_last)
+        x_imag = self.de2(x_last)
+        x_real = x_real.squeeze(dim = 1)
+        x_imag = x_imag.squeeze(dim = 1)
+
+        enh_real = noisy_real * x_real - noisy_imag * x_imag
+        enh_imag = noisy_real * x_imag + noisy_imag * x_real
+
+        enhanced_D = torch.stack([enh_real, enh_imag], 3)
+
+        enhanced_D = enhanced_D.unsqueeze(1)
+
+        DF_spec = self.df_op(enhanced_D.clone(), df_coefs)
+
+        DF_spec = DF_spec.squeeze(1)
+
+        DF_real = DF_spec[:, :, :, 0]
+        DF_imag = DF_spec[:, :, :, 1]
+
+
+        return DF_real, DF_imag
+
+
+
+
+
+class new_aia_mag_trans_ri(nn.Module):
+    def __init__(self):
+        super(new_aia_mag_trans_ri, self).__init__()
+        self.en_ri = dense_encoder()
+
+        self.dual_trans = AIA_Transformer(64, 64, num_layers=4)
+        self.aham = AHAM(input_channel=64)
+
+
+        self.de_mag = dense_decoder()
+
+
+
+
+    def forward(self, x):
+        batch_size, _, seq_len, _ = x.shape
+        noisy_real, noisy_imag = x[:,0,:,:], x[:,1,:,:]
+
+
+        # ri components enconde+ aia_transformer
+        x_ri = self.en_ri(x) #BCTF
+        x_last , x_outputlist = self.dual_trans(x_ri) #BCTF, #BCTFG
+        x_ri = self.aham(x_outputlist) #BCTF
+
+
+        # real and imag decode
+        mask_mag = self.de_mag(x_ri)
+        mask_mag = mask_mag.squeeze(1)
+
+        spec_mags = torch.sqrt(noisy_real ** 2 + noisy_imag ** 2 + 1e-8)
+        spec_phase = torch.atan2(noisy_imag, noisy_real)
+
+
+        est_mags = mask_mag * spec_mags
+        est_phase = spec_phase
+        enh_real = est_mags * torch.cos(est_phase)
+        enh_imag = est_mags * torch.sin(est_phase)
+
+
+        return enh_real, enh_imag
+
 
 class dense_encoder(nn.Module):
     def __init__(self, width =64):
@@ -227,6 +354,30 @@ class dense_decoder(nn.Module):
         super(dense_decoder, self).__init__()
         self.in_channels = 1
         self.out_channels = 1
+        self.pad = nn.ConstantPad2d((1, 1, 0, 0), value=0.)
+        self.pad1 = nn.ConstantPad2d((1, 0, 0, 0), value=0.)
+        self.width =width
+        self.dec_dense1 = DenseBlock(128, 4, self.width)
+        self.dec_conv1 = SPConvTranspose2d(in_channels=self.width, out_channels=self.width, kernel_size=(1, 3), r=2)
+        self.dec_norm1 = nn.LayerNorm(257)
+        self.dec_prelu1 = nn.PReLU(self.width)
+
+        self.out_conv = nn.Conv2d(in_channels=self.width, out_channels=self.out_channels, kernel_size=(1, 1))
+
+    def forward(self, x):
+        out = self.dec_dense1(x)
+        out = self.dec_prelu1(self.dec_norm1(self.pad1(self.dec_conv1(self.pad(out)))))
+
+        out = self.out_conv(out)
+        out.squeeze(dim=1)
+        return out
+
+
+class DF_dense_decoder(nn.Module):
+    def __init__(self, width =64, df_order = 5):
+        super(DF_dense_decoder, self).__init__()
+        self.in_channels = 1
+        self.out_channels = 2 * df_order
         self.pad = nn.ConstantPad2d((1, 1, 0, 0), value=0.)
         self.pad1 = nn.ConstantPad2d((1, 0, 0, 0), value=0.)
         self.width =width
@@ -329,7 +480,7 @@ class DenseBlock(nn.Module): #dilated dense block
 
 
 if __name__ == '__main__':
-    model = new_aia_complex_trans_ri()
+    model = DF_Serial_aia_complex_trans_ri()
     model.eval()
     x = torch.FloatTensor(4, 2, 10, 257)
     #
